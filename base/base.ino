@@ -313,25 +313,109 @@ char leerTeclado()
 String leerTarjeta()
 {
   /*
-   TODO - LABORATORIO RFID
+   IMPLEMENTADO - LABORATORIO RFID (Fase 0)
 
-   Utilizar el módulo RC522.
+   La lectura de una tarjeta ISO 14443A se realiza
+   en dos etapas distintas del protocolo:
 
-   El algoritmo deberá:
+   1. Deteccion de presencia
+   2. Anticolision y lectura del UID
 
-   1. Detectar si existe una nueva tarjeta.
-   2. Leer el identificador UID.
-   3. Recorrer los bytes del UID.
-   4. Convertirlos a una representación que pueda
-      utilizar el programa.
-   5. Retornar el UID.
-
-   Si no existe una tarjeta:
-
-       return "";
+   Por eso se necesitan dos llamadas y no una sola.
   */
 
-  return "";
+
+  // ----------------------------------------------------------
+  // 1. ¿Existe una tarjeta nueva dentro del campo?
+  // ----------------------------------------------------------
+
+  if (!rfid.PICC_IsNewCardPresent())
+  {
+    return "";
+  }
+
+
+  // ----------------------------------------------------------
+  // 2. ¿Se pudo leer su numero de serie?
+  // ----------------------------------------------------------
+
+  /*
+   Aqui se ejecuta el proceso de anticolision.
+
+   Si existieran varias tarjetas dentro del campo,
+   en este paso se negocia cual de ellas responde.
+  */
+
+  if (!rfid.PICC_ReadCardSerial())
+  {
+    return "";
+  }
+
+
+  // ----------------------------------------------------------
+  // 3. Convertir los bytes del UID a texto
+  // ----------------------------------------------------------
+
+  String uid = "";
+
+  /*
+   El UID no siempre mide 4 bytes.
+
+   Puede ser de 4, 7 o 10 bytes dependiendo del
+   tipo de tarjeta, por lo que se utiliza:
+
+       rfid.uid.size
+  */
+
+  for (byte i = 0; i < rfid.uid.size; i++)
+  {
+    /*
+     Un byte menor a 0x10 se imprime con un solo
+     digito.
+
+     Ejemplo:
+
+         String(0x06, HEX)  ->  "6"
+
+     Se agrega un cero al frente para conservar
+     siempre dos digitos por byte.
+    */
+
+    if (rfid.uid.uidByte[i] < 0x10)
+    {
+      uid += "0";
+    }
+
+    uid += String(rfid.uid.uidByte[i], HEX);
+
+    // Separar los bytes con :
+    if (i < rfid.uid.size - 1)
+    {
+      uid += ":";
+    }
+  }
+
+  uid.toUpperCase();
+
+
+  // ----------------------------------------------------------
+  // 4. Terminar la comunicacion con la tarjeta
+  // ----------------------------------------------------------
+
+  /*
+   PICC_HaltA() coloca la tarjeta en estado dormido.
+
+   Sin esta instruccion la tarjeta seguiria
+   respondiendo en cada vuelta del loop y el
+   sistema volveria a detectarla indefinidamente.
+  */
+
+  rfid.PICC_HaltA();
+
+  rfid.PCD_StopCrypto1();
+
+
+  return uid;
 }
 
 
@@ -339,19 +423,40 @@ String leerTarjeta()
 // 12. VALIDACIÓN DE TARJETA
 // ==============================================================
 
+/*
+ UID de los usuarios registrados.
+
+ TEMPORAL:
+
+ En esta fase los identificadores se encuentran
+ escritos directamente en el programa.
+
+ En el laboratorio de EEPROM seran trasladados
+ a la memoria no volatil del microcontrolador.
+*/
+
+const String USUARIO_1 = "4E:27:D6:06";   // Tarjeta
+const String USUARIO_2 = "9D:74:14:06";   // Llavero
+
+
 bool tarjetaAutorizada(String uid)
 {
   /*
-   TODO - LABORATORIO RFID
+   IMPLEMENTADO - LABORATORIO RFID (Fase 0)
 
-   Determinar si el UID recibido pertenece
-   a una tarjeta autorizada.
-
-   Retornar:
-
-       true  -> tarjeta autorizada
-       false -> tarjeta no autorizada
+   Comparar el UID recibido contra los
+   usuarios registrados.
   */
+
+  if (uid == USUARIO_1)
+  {
+    return true;
+  }
+
+  if (uid == USUARIO_2)
+  {
+    return true;
+  }
 
   return false;
 }
@@ -609,7 +714,46 @@ void setup()
 
   SPI.begin();
 
+
+  /*
+   Doble inicializacion.
+
+   Algunos modulos RC522 no completan correctamente
+   su arranque en el primer intento.
+  */
+
   rfid.PCD_Init();
+
+  delay(50);
+
+  rfid.PCD_Init();
+
+
+  /*
+   Ganancia maxima de recepcion de la antena.
+
+   El registro de ganancia no toma efecto hasta
+   que la antena se apaga y se vuelve a encender.
+  */
+
+  rfid.PCD_SetAntennaGain(MFRC522::RxGain_max);
+
+  rfid.PCD_AntennaOff();
+
+  rfid.PCD_AntennaOn();
+
+
+  /*
+   DEPURACION - temporal
+
+   Lee por SPI el registro de version del RC522.
+
+   0x92 o 0x91 -> modulo original
+   0x82         -> modulo clon (funciona igual)
+   0x00 o 0xFF  -> no hay comunicacion SPI
+  */
+
+  rfid.PCD_DumpVersionToSerial();
 
 
   // ----------------------------------------------------------
@@ -627,6 +771,11 @@ void setup()
   delay(1500);
 
   reiniciarSistema();
+
+
+  // DEPURACION - temporal
+
+  Serial.println("SISTEMA LISTO - ACERQUE TARJETA");
 }
 
 
@@ -663,6 +812,27 @@ void loop()
 
       if (UIDLeido != "")
       {
+        // ----------------------------------------------------
+        // DEPURACION - Fase 0
+        // ----------------------------------------------------
+
+        /*
+         Estas lineas permiten observar el
+         funcionamiento del Estado 0 mientras el
+         LCD todavia no se encuentra conectado.
+
+         Deben eliminarse al integrar el LCD.
+        */
+
+        Serial.print("UID leido  : ");
+        Serial.println(UIDLeido);
+
+        Serial.print("Autorizada : ");
+        Serial.println(tarjetaAutorizada(UIDLeido) ? "SI" : "NO");
+
+        Serial.println("------------------------------");
+
+
         if (tarjetaAutorizada(UIDLeido))
         {
           lcd.clear();
