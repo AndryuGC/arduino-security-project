@@ -1,23 +1,6 @@
 /*
- ==============================================================
-             ARQUITECTURA DEL COMPUTADOR
-        PROYECTO: SISTEMA DE CONTROL DE ACCESO
-
-                 PROGRAMA BASE
- ==============================================================
-
- Este programa contiene la arquitectura general del proyecto.
-
- El código está INCOMPLETO intencionalmente.
-
- Durante los siguientes laboratorios se implementarán
- progresivamente las funciones marcadas como:
-
-                         TODO
-
- Al finalizar los laboratorios, este programa se habrá
- convertido en el sistema completo de control de acceso.
- ==============================================================
+ Andry Gonzalez
+ Rodrigo Guerra
 */
 
 
@@ -40,7 +23,7 @@
  D0  -> Serial RX
  D1  -> Serial TX
 
- D2  -> Buzzer pasivo
+ D2  -> Buzzer
  D3  -> Botón de diagnóstico
  D4  -> Servo
 
@@ -48,9 +31,9 @@
 
  D6  -> RFID RST
 
- D7  -> 74HC595 DATA
- D8  -> 74HC595 CLOCK
- D9  -> 74HC595 LATCH
+ D7  -> 74HC595 DATA   (compartido por los dos 74HC595)
+ D8  -> 74HC595 CLOCK  (compartido por los dos 74HC595)
+ D9  -> 74HC595 LATCH  (compartido por los dos 74HC595)
 
  D10 -> RFID SDA / SS
  D11 -> RFID MOSI
@@ -96,41 +79,66 @@ MFRC522 rfid(RFID_SS, RFID_RST);
 
 
 // ==============================================================
-// 3. REGISTRO DE DESPLAZAMIENTO 74HC595
+// 3. REGISTROS DE DESPLAZAMIENTO 74HC595 (ENCADENADOS)
 // ==============================================================
 
 /*
+ Dos 74HC595 en cadena: el pin Q7' (pin 9) del primero se
+ conecta al pin DS (pin 14) del segundo. Ambos comparten
+ CLOCK y LATCH.
 
-                  74HC595
-
-             Q0 ─────► Keypad R1
-             Q1 ─────► Keypad R2
-             Q2 ─────► Keypad R3
-             Q3 ─────► Keypad R4
-
-             Q4 ─────► LED verde
-             Q5 ─────► LED rojo
-             Q6 ─────► LED amarillo
-             Q7 ─────► LED azul
-
-
- Bits:
-
+ REGISTRO 1 (primer 74HC595) - Teclado
+ ------------------------------------------------------
        7   6   5   4   3   2   1   0
      ┌───┬───┬───┬───┬───┬───┬───┬───┐
-     │AZ │AM │RO │VE │R4 │R3 │R2 │R1 │
+     │ - │ - │ - │ - │R4 │R3 │R2 │R1 │
      └───┴───┴───┴───┴───┴───┴───┴───┘
 
+ REGISTRO 2 (segundo 74HC595) - LEDs de estado
+ ------------------------------------------------------
+       7   6   5   4   3   2   1   0
+     ┌───┬───┬───┬───┬───┬───┬───┬───┐
+     │L8 │L7 │L6 │L5 │L4 │L3 │L2 │L1 │
+     └───┴───┴───┴───┴───┴───┴───┴───┘
 */
 
-// Inicialmente las cuatro filas están HIGH.
+// Inicialmente las cuatro filas del teclado están HIGH.
+byte registro1 = B00001111;
 
-byte registro = B00001111;
+// Inicialmente todos los LEDs apagados.
+byte registro2 = B00000000;
+
+
+// ==============================================================
+// 3.1 VALORES BINARIOS DE LOS ESTADOS (LEDs)
+// ==============================================================
+
+/*
+ Cada estado del sistema se representa encendiendo
+ un único LED.
+*/
+
+const byte LED_INICIO         = B00000001;   // LED 1
+const byte LED_ESPERANDO_RFID = B00000010;   // LED 2
+const byte LED_VALIDANDO_RFID = B00000100;   // LED 3
+const byte LED_ESPERANDO_PIN  = B00001000;   // LED 4
+const byte LED_VALIDANDO_PIN  = B00010000;   // LED 5
+const byte LED_AUTORIZADO     = B00100000;   // LED 6
+const byte LED_DENEGADO       = B01000000;   // LED 7
+const byte LED_ALARMA         = B10000000;   // LED 8
 
 
 // ==============================================================
 // 4. MAPA DEL KEYPAD
 // ==============================================================
+
+/*
+ Teclas con función especial:
+
+   0-9 -> dígitos del PIN
+   *   -> borrar el último dígito
+   #   -> confirmar el PIN
+*/
 
 char teclas[4][4] = {
 
@@ -148,7 +156,8 @@ char teclas[4][4] = {
 
 // UID obtenido del RC522
 
-String UIDLeido = "";
+byte uidLeido[4];
+byte uidTam = 0;
 
 
 // PIN introducido mediante el keypad
@@ -161,6 +170,20 @@ byte posicionPIN = 0;
 // Número de intentos incorrectos
 
 byte intentosFallidos = 0;
+
+
+// Usuarios en EEPROM: [UID 4 bytes][PIN 4 caracteres] x NUM_USUARIOS
+
+const byte NUM_USUARIOS = 2;
+const byte DIR_MAGIC = 0;        // marca para saber si la EEPROM ya fue inicializada
+const byte VALOR_MAGIC = 0x43;
+const byte DIR_USUARIOS = 1;
+const byte TAM_REGISTRO = 8;
+
+
+// Usuario cuya tarjeta fue reconocida (-1 = ninguno)
+
+int usuarioActual = -1;
 
 
 // ==============================================================
@@ -197,59 +220,39 @@ EstadoSistema estado = ESPERANDO_RFID;
 
 
 // ==============================================================
-// 7. ACTUALIZAR 74HC595
+// 7. ACTUALIZAR LOS DOS 74HC595
 // ==============================================================
 
 void actualizarRegistro()
 {
   digitalWrite(LATCH, LOW);
 
-  shiftOut(DATA, CLOCK, MSBFIRST, registro);
+  shiftOut(DATA, CLOCK, MSBFIRST, registro2);
+
+  // Con un solo 74HC595 esta línea se comenta.
+  // Al reconectar el segundo chip (teclado), se descomenta.
+  // shiftOut(DATA, CLOCK, MSBFIRST, registro1);
 
   digitalWrite(LATCH, HIGH);
 }
 
 
 // ==============================================================
-// 8. CONTROL DE LEDs
+// 8. CONTROL DE LEDs DE ESTADO
 // ==============================================================
 
-void apagarLEDs()
+// Envía al segundo 74HC595 el valor binario del estado actual.
+void mostrarEstadoLED(byte valor)
 {
-  /*
-   TODO - REGISTROS / OPERACIONES BINARIAS
+  registro2 = valor;
 
-   Los LEDs se encuentran conectados a Q4-Q7.
-
-   Deben apagarse SIN modificar Q0-Q3,
-   ya que esos bits controlan las filas
-   del teclado.
-
-   Modificar la variable:
-
-       registro
-
-   y posteriormente actualizar el 74HC595.
-  */
+  actualizarRegistro();
 }
 
 
-void encenderLED(byte numero)
+void apagarLEDs()
 {
-  /*
-   TODO - REGISTROS / OPERACIONES BINARIAS
-
-   Encender solamente uno de los LEDs.
-
-       numero = 0 -> Q4 -> Verde
-       numero = 1 -> Q5 -> Rojo
-       numero = 2 -> Q6 -> Amarillo
-       numero = 3 -> Q7 -> Azul
-
-   IMPORTANTE:
-
-   No modificar Q0-Q3.
-  */
+  mostrarEstadoLED(0);
 }
 
 
@@ -259,22 +262,13 @@ void encenderLED(byte numero)
 
 void seleccionarFila(byte fila)
 {
-  /*
-   TODO - LABORATORIO KEYPAD
+  // Q0-Q3 en HIGH
+  registro1 |= B00001111;
 
-   Para detectar una tecla:
+  // Solo la fila seleccionada en LOW
+  bitClear(registro1, fila);
 
-   1. Colocar Q0-Q3 en HIGH.
-
-   2. Colocar únicamente la fila que se desea
-      consultar en LOW.
-
-   3. Enviar el nuevo valor al 74HC595.
-
-   Pista:
-
-       bitClear()
-  */
+  actualizarRegistro();
 }
 
 
@@ -284,23 +278,33 @@ void seleccionarFila(byte fila)
 
 char leerTeclado()
 {
-  /*
-   TODO - LABORATORIO KEYPAD
+  for (byte fila = 0; fila < 4; fila++)
+  {
+    seleccionarFila(fila);
 
-   Implementar el barrido de la matriz 4x4.
+    delayMicroseconds(10);
 
-   El algoritmo deberá:
+    for (byte columna = 0; columna < 4; columna++)
+    {
+      if (digitalRead(columnas[columna]) == LOW)
+      {
+        delay(30);   // anti-rebote
 
-   1. Seleccionar una fila.
-   2. Leer las cuatro columnas.
-   3. Determinar qué tecla fue presionada.
-   4. Manejar el rebote de la tecla.
-   5. Retornar el carácter correspondiente.
+        if (digitalRead(columnas[columna]) == LOW)
+        {
+          char tecla = teclas[fila][columna];
 
-   Si ninguna tecla fue presionada:
+          // Esperar a que se suelte la tecla
+          while (digitalRead(columnas[columna]) == LOW)
+          {
+            delay(5);
+          }
 
-       return 0;
-  */
+          return tecla;
+        }
+      }
+    }
+  }
 
   return 0;
 }
@@ -310,92 +314,152 @@ char leerTeclado()
 // 11. LECTURA DEL RFID
 // ==============================================================
 
-String leerTarjeta()
+void cargarUsuariosIniciales()
 {
-  /*
-   TODO - LABORATORIO RFID
+  if (EEPROM.read(DIR_MAGIC) == VALOR_MAGIC) return;   // ya estaban guardados
 
-   Utilizar el módulo RC522.
+  // UID reales de las tarjetas del proyecto
+  const byte uids[NUM_USUARIOS][4] = {
+    {0x4E, 0x27, 0xD6, 0x06},   // tarjeta
+    {0x9D, 0x74, 0x14, 0x06}    // llavero
+  };
 
-   El algoritmo deberá:
+  const char pins[NUM_USUARIOS][5] = { "1234", "4321" };
 
-   1. Detectar si existe una nueva tarjeta.
-   2. Leer el identificador UID.
-   3. Recorrer los bytes del UID.
-   4. Convertirlos a una representación que pueda
-      utilizar el programa.
-   5. Retornar el UID.
+  for (byte u = 0; u < NUM_USUARIOS; u++)
+  {
+    int base = DIR_USUARIOS + u * TAM_REGISTRO;
 
-   Si no existe una tarjeta:
+    for (byte i = 0; i < 4; i++) EEPROM.update(base + i, uids[u][i]);
+    for (byte i = 0; i < 4; i++) EEPROM.update(base + 4 + i, pins[u][i]);
+  }
 
-       return "";
-  */
-
-  return "";
+  EEPROM.update(DIR_MAGIC, VALOR_MAGIC);
 }
 
+
+
+
+
+// Devuelve true si se leyó una tarjeta nueva (UID queda en uidLeido)
+bool leerTarjeta()
+{
+  if (!rfid.PICC_IsNewCardPresent()) return false;
+  if (!rfid.PICC_ReadCardSerial())   return false;
+
+  uidTam = rfid.uid.size;
+
+  for (byte i = 0; i < 4; i++)
+  {
+    uidLeido[i] = (i < uidTam) ? rfid.uid.uidByte[i] : 0;
+  }
+
+  Serial.print(F("UID: "));
+  for (byte i = 0; i < uidTam; i++)
+  {
+    if (rfid.uid.uidByte[i] < 0x10) Serial.print('0');
+    Serial.print(rfid.uid.uidByte[i], HEX);
+  }
+  Serial.println();
+
+  rfid.PICC_HaltA();        // detener la tarjeta para no leerla en bucle
+  rfid.PCD_StopCrypto1();
+
+  return true;
+}
 
 // ==============================================================
 // 12. VALIDACIÓN DE TARJETA
 // ==============================================================
 
-bool tarjetaAutorizada(String uid)
+bool tarjetaAutorizada()
 {
-  /*
-   TODO - LABORATORIO RFID
+  usuarioActual = -1;
 
-   Determinar si el UID recibido pertenece
-   a una tarjeta autorizada.
+  if (uidTam != 4) return false;   // este sistema guarda UID de 4 bytes
 
-   Retornar:
+  for (byte u = 0; u < NUM_USUARIOS; u++)
+  {
+    int base = DIR_USUARIOS + u * TAM_REGISTRO;
+    bool igual = true;
 
-       true  -> tarjeta autorizada
-       false -> tarjeta no autorizada
-  */
+    for (byte i = 0; i < 4; i++)
+    {
+      if (EEPROM.read(base + i) != uidLeido[i])
+      {
+        igual = false;
+        break;
+      }
+    }
+
+    if (igual)
+    {
+      usuarioActual = u;
+      return true;
+    }
+  }
 
   return false;
 }
-
 
 // ==============================================================
 // 13. CAPTURA DEL PIN
 // ==============================================================
 
+// Línea 2 del LCD: asteriscos por cada dígito y guiones por los faltantes
+void dibujarPIN()
+{
+  lcd.setCursor(0, 1);
+
+  for (byte i = 0; i < 4; i++)
+  {
+    lcd.print(i < posicionPIN ? '*' : '_');
+  }
+}
+
+
+void mostrarPantallaPIN()
+{
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("INGRESE SU PIN");
+
+  dibujarPIN();
+}
+
+
 bool leerPIN()
 {
-  /*
-   TODO - LABORATORIO KEYPAD / INTEGRACIÓN
+  char tecla = leerTeclado();
 
-   Utilizar:
+  if (tecla == 0) return false;
 
-       leerTeclado()
+  if (tecla >= '0' && tecla <= '9')
+  {
+    if (posicionPIN < 4)
+    {
+      pinIngresado[posicionPIN] = tecla;
+      posicionPIN++;
+      pinIngresado[posicionPIN] = '\0';
 
-   para capturar un PIN de cuatro números.
+      dibujarPIN();
+    }
+  }
+  else if (tecla == '*')            // borrar
+  {
+    if (posicionPIN > 0)
+    {
+      posicionPIN--;
+      pinIngresado[posicionPIN] = '\0';
 
-   Cada número deberá almacenarse en:
-
-       pinIngresado
-
-   Cuando existan cuatro números:
-
-       return true;
-
-   Mientras el usuario continúe escribiendo:
-
-       return false;
-
-
-   SUGERENCIA:
-
-   En el LCD no mostrar los números.
-
-   Mostrar:
-
-       *
-       **
-       ***
-       ****
-  */
+      dibujarPIN();
+    }
+  }
+  else if (tecla == '#')            // confirmar
+  {
+    if (posicionPIN == 4) return true;
+  }
 
   return false;
 }
@@ -407,25 +471,16 @@ bool leerPIN()
 
 bool validarPIN()
 {
-  /*
-   TODO - LABORATORIO EEPROM
+  if (usuarioActual < 0) return false;
 
-   El PIN autorizado se encuentra almacenado
-   en la memoria EEPROM.
+  int base = DIR_USUARIOS + usuarioActual * TAM_REGISTRO + 4;
 
-   El algoritmo deberá:
+  for (byte i = 0; i < 4; i++)
+  {
+    if (EEPROM.read(base + i) != pinIngresado[i]) return false;
+  }
 
-   1. Leer el PIN almacenado.
-   2. Compararlo con pinIngresado.
-   3. Determinar si son iguales.
-
-   Retornar:
-
-       true  -> PIN correcto
-       false -> PIN incorrecto
-  */
-
-  return false;
+  return true;
 }
 
 
@@ -468,8 +523,7 @@ void sonidoCorrecto()
   /*
    TODO - LABORATORIO BUZZER
 
-   Utilizar el buzzer pasivo para generar
-   un sonido que indique acceso autorizado.
+   Generar un sonido que indique acceso autorizado.
   */
 }
 
@@ -498,16 +552,8 @@ void activarAlarma()
   /*
    TODO - PROYECTO FINAL
 
-   Diseñar el comportamiento de la alarma.
-
-   Puede utilizar:
-
-       - LED rojo
-       - Buzzer
-       - LCD
-
-   La implementación queda a criterio
-   de cada equipo.
+   Buzzer activo encendido hasta presionar la tecla
+   que apaga la alarma. Después, reiniciarSistema().
   */
 }
 
@@ -518,7 +564,9 @@ void activarAlarma()
 
 void reiniciarSistema()
 {
-  UIDLeido = "";
+ uidTam = 0;
+
+  usuarioActual = -1;
 
   posicionPIN = 0;
 
@@ -528,11 +576,13 @@ void reiniciarSistema()
   lcd.clear();
 
   lcd.setCursor(0, 0);
-  lcd.print("SISTEMA URL");
+  lcd.print("CONTROL ACCESO");
 
   lcd.setCursor(0, 1);
-  lcd.print("ACERQUE TARJETA");
+  lcd.print("PRESENTE TARJETA");
 
+
+  mostrarEstadoLED(LED_ESPERANDO_RFID);
 
   estado = ESPERANDO_RFID;
 }
@@ -619,13 +669,17 @@ void setup()
   lcd.clear();
 
   lcd.setCursor(0, 0);
-  lcd.print("SISTEMA URL");
+  lcd.print("SISTEMA ACCESO");
 
   lcd.setCursor(0, 1);
   lcd.print("INICIANDO...");
 
+  mostrarEstadoLED(LED_INICIO);
+
   delay(1500);
 
+  cargarUsuariosIniciales();
+  //for (byte i = 0; i < 8; i++) { mostrarEstadoLED(1 << i); delay(300); } prueba leds
   reiniciarSistema();
 }
 
@@ -657,21 +711,21 @@ void loop()
     // ESTADO 0 - ESPERANDO RFID
     // ========================================================
 
-    case ESPERANDO_RFID:
+        case ESPERANDO_RFID:
 
-      UIDLeido = leerTarjeta();
-
-      if (UIDLeido != "")
+      if (leerTarjeta())
       {
-        if (tarjetaAutorizada(UIDLeido))
+        mostrarEstadoLED(LED_VALIDANDO_RFID);
+
+        delay(300);   // para que el LED 3 alcance a verse
+
+        if (tarjetaAutorizada())
         {
-          lcd.clear();
+          intentosFallidos = 0;      // nuevo proceso de autenticación
 
-          lcd.setCursor(0, 0);
-          lcd.print("TARJETA VALIDA");
+          mostrarPantallaPIN();
 
-          lcd.setCursor(0, 1);
-          lcd.print("INGRESE PIN");
+          mostrarEstadoLED(LED_ESPERANDO_PIN);
 
           estado = ESPERANDO_PIN;
         }
@@ -704,6 +758,10 @@ void loop()
 
     case VALIDANDO_PIN:
 
+      mostrarEstadoLED(LED_VALIDANDO_PIN);
+
+      delay(300);   // para que el LED 5 alcance a verse
+
       if (validarPIN())
       {
         estado = ACCESO_AUTORIZADO;
@@ -712,7 +770,39 @@ void loop()
       {
         intentosFallidos++;
 
-        estado = ACCESO_DENEGADO;
+        if (intentosFallidos >= 3)
+        {
+          // Tercer intento: ACCESO DENEGADO y luego ALARMA
+          estado = ACCESO_DENEGADO;
+        }
+        else
+        {
+          // Primer o segundo intento: permitir reintento
+          lcd.clear();
+
+          lcd.setCursor(0, 0);
+          lcd.print("PIN INCORRECTO");
+
+          lcd.setCursor(0, 1);
+          lcd.print("INTENTO ");
+          lcd.print(intentosFallidos);
+          lcd.print("/3");
+
+          mostrarEstadoLED(LED_DENEGADO);
+
+          sonidoError();
+
+          delay(1500);
+
+          posicionPIN = 0;
+          pinIngresado[0] = '\0';
+
+          mostrarPantallaPIN();
+
+          mostrarEstadoLED(LED_ESPERANDO_PIN);
+
+          estado = ESPERANDO_PIN;
+        }
       }
 
       break;
@@ -724,6 +814,9 @@ void loop()
 
     case ACCESO_AUTORIZADO:
 
+      // "ACCESO AUTORIZADO" (17 caracteres) no cabe en una
+      // línea de 16, por eso se divide en dos.
+
       lcd.clear();
 
       lcd.setCursor(0, 0);
@@ -733,7 +826,7 @@ void loop()
       lcd.print("AUTORIZADO");
 
 
-      encenderLED(0);
+      mostrarEstadoLED(LED_AUTORIZADO);
 
       sonidoCorrecto();
 
@@ -751,32 +844,50 @@ void loop()
 
     case ACCESO_DENEGADO:
 
-      lcd.clear();
+      mostrarEstadoLED(LED_DENEGADO);
 
-      lcd.setCursor(0, 0);
-      lcd.print("ACCESO");
-
-      lcd.setCursor(0, 1);
-      lcd.print("DENEGADO");
-
-
-      encenderLED(1);
-
-      sonidoError();
-
-
-      delay(1500);
-
-
-      if (intentosFallidos >= 3)
+      if (usuarioActual < 0)
       {
-        estado = ALARMA;
-      }
-      else
-      {
+        // Tarjeta no registrada
+
+        lcd.clear();
+
+        lcd.setCursor(0, 0);
+        lcd.print("TARJETA INVALIDA");
+
+        lcd.setCursor(0, 1);
+        lcd.print("ACCESO DENEGADO");
+
+        sonidoError();
+
+        delay(1500);
+
         apagarLEDs();
 
         reiniciarSistema();
+      }
+      else
+      {
+        // Tercer intento de PIN fallido
+
+        lcd.clear();
+
+        lcd.setCursor(0, 0);
+        lcd.print("ACCESO DENEGADO");
+
+        sonidoError();
+
+        delay(1500);
+
+        lcd.clear();
+
+        lcd.setCursor(0, 0);
+        lcd.print("ACCESO BLOQUEADO");
+
+        lcd.setCursor(0, 1);
+        lcd.print("ALARMA ACTIVADA");
+
+        estado = ALARMA;
       }
 
       break;
@@ -815,11 +926,7 @@ void loop()
 
     case ALARMA:
 
-      lcd.clear();
-
-      lcd.setCursor(0, 0);
-      lcd.print("!!! ALARMA !!!");
-
+      mostrarEstadoLED(LED_ALARMA);
 
       activarAlarma();
 
